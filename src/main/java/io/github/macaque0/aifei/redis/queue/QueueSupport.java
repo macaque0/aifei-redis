@@ -91,6 +91,10 @@ abstract class QueueSupport<T> {
         return message(id, body, meta, parseInt(attempts, 0));
     }
 
+    public String maintenanceName() {
+        return keys.name;
+    }
+
     protected boolean expired(String meta, long now) {
         if (options.getMessageTtlMillis() <= 0) {
             return false;

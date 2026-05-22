@@ -16,6 +16,9 @@ public class RedisConfigTest {
         assertEquals("aifei", config.getKeyPrefix());
         assertEquals(30000, config.getQueueDefaultVisibilityTimeoutMillis());
         assertEquals(16, config.getQueueDefaultMaxRetries());
+        assertEquals(true, config.isQueueListenerEnabled());
+        assertEquals(false, config.isQueueMessageLogEnabled());
+        assertEquals(false, config.isQueueMessageLogBodyEnabled());
     }
 
     @Test(expected = IllegalArgumentException.class)

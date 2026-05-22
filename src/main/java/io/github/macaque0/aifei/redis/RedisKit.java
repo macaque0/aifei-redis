@@ -66,6 +66,26 @@ public class RedisKit {
         return getRedis().pttl(key);
     }
 
+    public static RedisLock tryLock(String key, long expireMillis) {
+        return getRedis().tryLock(key, expireMillis);
+    }
+
+    public static RedisLock tryLock(String key, String token, long expireMillis) {
+        return getRedis().tryLock(key, token, expireMillis);
+    }
+
+    public static RedisLock tryLock(String key, long expireMillis, long waitMillis) {
+        return getRedis().tryLock(key, expireMillis, waitMillis);
+    }
+
+    public static Boolean unlock(String key, String token) {
+        return getRedis().unlock(key, token);
+    }
+
+    public static Boolean renewLock(String key, String token, long expireMillis) {
+        return getRedis().renewLock(key, token, expireMillis);
+    }
+
     public static Long incr(String key) {
         return getRedis().incr(key);
     }

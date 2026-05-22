@@ -1,6 +1,7 @@
 package io.github.macaque0.aifei.redis.queue;
 
 import io.github.macaque0.aifei.redis.Redis;
+import io.github.macaque0.aifei.redis.RedisException;
 import io.github.macaque0.aifei.redis.codec.RedisCodec;
 import io.github.macaque0.aifei.redis.script.RedisScripts;
 
@@ -32,26 +33,14 @@ class DefaultRedisPriorityQueue<T> extends QueueSupport<T> implements RedisPrior
         final String meta = meta(now, now, 0, 0, null);
         final double score = priorityScore(priority, now);
         return redis.execute(jedis -> {
-            if (options.getMaxLength() > 0 && jedis.zcard(keys.priority) >= options.getMaxLength()) {
-                if (options.getFullQueuePolicy() == FullQueuePolicy.DROP_NEWEST) {
-                    return false;
-                }
-                if (options.getFullQueuePolicy() == FullQueuePolicy.REJECT) {
-                    throw new io.github.macaque0.aifei.redis.RedisException("Queue is full: " + keys.name);
-                }
-                Set<String> oldest = jedis.zrevrange(keys.priority, 0, 0);
-                for (String old : oldest) {
-                    deletePayload(jedis, old);
-                }
+            Object ret = jedis.eval(RedisScripts.PRIORITY_OFFER, priorityKeys(),
+                    Arrays.asList(id, encoded, meta, String.valueOf(score), String.valueOf(priority),
+                            String.valueOf(options.getMaxLength()), options.getFullQueuePolicy().name()));
+            long value = asLong(ret);
+            if (value < 0) {
+                throw new RedisException("Queue is full: " + keys.name);
             }
-            if (jedis.hexists(keys.payload, id)) {
-                return false;
-            }
-            jedis.hset(keys.payload, id, encoded);
-            jedis.hset(keys.meta, id, meta);
-            jedis.hset(keys.priorityValue, id, String.valueOf(priority));
-            jedis.zadd(keys.priority, score, id);
-            return true;
+            return value == 1L;
         });
     }
 
@@ -97,17 +86,14 @@ class DefaultRedisPriorityQueue<T> extends QueueSupport<T> implements RedisPrior
     @Override
     public void ack(String messageId) {
         final String id = requireMessageId(messageId);
-        redis.execute(jedis -> {
-            deletePayload(jedis, id);
-            return null;
-        });
+        redis.execute(jedis -> jedis.eval(RedisScripts.PRIORITY_ACK, priorityKeys(), Arrays.asList(id)));
     }
 
     @Override
     public void nack(String messageId) {
         final String id = requireMessageId(messageId);
         redis.execute(jedis -> {
-            retryNow(jedis, id);
+            retryNow(jedis, id, System.currentTimeMillis());
             return null;
         });
     }
@@ -119,24 +105,16 @@ class DefaultRedisPriorityQueue<T> extends QueueSupport<T> implements RedisPrior
         }
         final String id = requireMessageId(messageId);
         final long availableAt = System.currentTimeMillis() + delayMillis;
-        redis.execute(jedis -> {
-            if (jedis.hexists(keys.payload, id)) {
-                jedis.zrem(keys.reserved, id);
-                jedis.zadd(keys.delay, availableAt, id);
-            }
-            return null;
-        });
+        redis.execute(jedis -> jedis.eval(RedisScripts.PRIORITY_RETRY_LATER, priorityKeys(),
+                Arrays.asList(id, String.valueOf(availableAt))));
     }
 
     @Override
     public void dead(String messageId, String reason) {
         final String id = requireMessageId(messageId);
         final long now = System.currentTimeMillis();
-        redis.execute(jedis -> {
-            jedis.zrem(keys.priority, id);
-            jedis.eval(RedisScripts.DEAD, keys.commonKeys(), Arrays.asList(id, String.valueOf(now), "dead:" + safe(reason)));
-            return null;
-        });
+        redis.execute(jedis -> jedis.eval(RedisScripts.PRIORITY_DEAD, priorityKeys(),
+                Arrays.asList(id, String.valueOf(now), "dead:" + safe(reason))));
     }
 
     @Override
@@ -180,25 +158,25 @@ class DefaultRedisPriorityQueue<T> extends QueueSupport<T> implements RedisPrior
         redis.execute(jedis -> {
             Set<String> delayed = jedis.zrangeByScore(keys.delay, 0, now, 0, options.getMaintainBatchSize());
             for (String id : delayed) {
-                if (jedis.zrem(keys.delay, id) == 1) {
-                    addReady(jedis, id, now);
-                }
+                jedis.eval(RedisScripts.PRIORITY_PROMOTE_DELAY, priorityKeys(),
+                        Arrays.asList(id, String.valueOf(now), String.valueOf(PRIORITY_FACTOR)));
             }
 
             Set<String> expired = jedis.zrangeByScore(keys.reserved, 0, now, 0, options.getMaintainBatchSize());
             for (String id : expired) {
                 String attemptsValue = jedis.hget(keys.attempts, id);
-                int attempts = attemptsValue == null ? 0 : Integer.parseInt(attemptsValue);
+                int attempts = parseInt(attemptsValue, 0);
                 String meta = jedis.hget(keys.meta, id);
                 if (expired(meta, now) || attempts >= options.getMaxRetries()) {
-                    jedis.eval(RedisScripts.DEAD, keys.commonKeys(), Arrays.asList(id, String.valueOf(now), expired(meta, now) ? "expired" : "maxRetries"));
+                    jedis.eval(RedisScripts.PRIORITY_DEAD, priorityKeys(),
+                            Arrays.asList(id, String.valueOf(now), expired(meta, now) ? "expired" : "maxRetries"));
                 } else {
                     long delay = options.getRetryDelayPolicy().nextDelayMillis(attempts, readMessage(jedis, id));
                     if (delay <= 0) {
-                        retryNow(jedis, id);
+                        retryNow(jedis, id, now);
                     } else {
-                        jedis.zrem(keys.reserved, id);
-                        jedis.zadd(keys.delay, now + delay, id);
+                        jedis.eval(RedisScripts.PRIORITY_RETRY_LATER, priorityKeys(),
+                                Arrays.asList(id, String.valueOf(now + delay)));
                     }
                 }
             }
@@ -207,58 +185,37 @@ class DefaultRedisPriorityQueue<T> extends QueueSupport<T> implements RedisPrior
     }
 
     private RedisMessage<T> reserveOne(String consumerId) {
-        return redis.execute(jedis -> {
+        Object ret = redis.execute(jedis -> {
             if (isPaused(jedis)) {
                 return null;
             }
-            for (int i = 0; i < options.getMaintainBatchSize(); i++) {
-                Set<String> ids = jedis.zrange(keys.priority, 0, 0);
-                if (ids.isEmpty()) {
-                    return null;
-                }
-                String id = ids.iterator().next();
-                if (jedis.zrem(keys.priority, id) != 1) {
-                    continue;
-                }
-                String body = jedis.hget(keys.payload, id);
-                if (body == null) {
-                    deletePayload(jedis, id);
-                    continue;
-                }
-                String oldMeta = jedis.hget(keys.meta, id);
-                long now = System.currentTimeMillis();
-                if (expired(oldMeta, now)) {
-                    jedis.zadd(keys.dead, now, id);
-                    jedis.hset(keys.meta, id, oldMeta == null ? "0|0|0|0|expired" : oldMeta + "|expired");
-                    continue;
-                }
-                int attempts = Math.toIntExact(jedis.hincrBy(keys.attempts, id, 1));
-                long reservedUntil = now + options.getVisibilityTimeoutMillis();
-                String meta = preserveMeta(oldMeta, reservedUntil, attempts, consumerId);
-                jedis.hset(keys.meta, id, meta);
-                jedis.zadd(keys.reserved, reservedUntil, id);
-                return message(id, body, meta, attempts);
-            }
-            return null;
+            long now = System.currentTimeMillis();
+            long reservedUntil = now + options.getVisibilityTimeoutMillis();
+            return jedis.eval(RedisScripts.PRIORITY_RESERVE, priorityKeys(),
+                    Arrays.asList(String.valueOf(reservedUntil), consumerId,
+                            String.valueOf(options.getMaintainBatchSize()), String.valueOf(now),
+                            String.valueOf(options.getMessageTtlMillis())));
         });
-    }
-
-    private void retryNow(redis.clients.jedis.Jedis jedis, String id) {
-        if (jedis.hexists(keys.payload, id)) {
-            jedis.zrem(keys.reserved, id);
-            addReady(jedis, id, System.currentTimeMillis());
+        if (ret == null) {
+            return null;
         }
+        @SuppressWarnings("unchecked")
+        List<Object> values = (List<Object>) ret;
+        String id = String.valueOf(values.get(0));
+        String body = String.valueOf(values.get(1));
+        int attempts = ((Number) values.get(2)).intValue();
+        String meta = String.valueOf(values.get(3));
+        return message(id, body, meta, attempts);
     }
 
-    private void addReady(redis.clients.jedis.Jedis jedis, String id, long now) {
-        String priorityValue = jedis.hget(keys.priorityValue, id);
-        int priority = priorityValue == null ? 0 : Integer.parseInt(priorityValue);
-        jedis.zadd(keys.priority, priorityScore(priority, now), id);
+    private void retryNow(redis.clients.jedis.Jedis jedis, String id, long now) {
+        jedis.eval(RedisScripts.PRIORITY_RETRY_NOW, priorityKeys(),
+                Arrays.asList(id, String.valueOf(now), String.valueOf(PRIORITY_FACTOR)));
     }
 
-    private String preserveMeta(String oldMeta, long reservedUntil, int attempts, String consumerId) {
-        Meta meta = Meta.parse(oldMeta);
-        return meta(meta.createdAtMillis, meta.availableAtMillis, reservedUntil, attempts, consumerId);
+    private List<String> priorityKeys() {
+        return Arrays.asList(keys.priority, keys.reserved, keys.payload, keys.meta,
+                keys.attempts, keys.delay, keys.dead, keys.priorityValue);
     }
 
     private static double priorityScore(int priority, long now) {
@@ -283,5 +240,17 @@ class DefaultRedisPriorityQueue<T> extends QueueSupport<T> implements RedisPrior
 
     private static String safe(String value) {
         return value == null ? "" : value.replace("|", "_");
+    }
+
+    private static long asLong(Object value) {
+        return ((Number) value).longValue();
+    }
+
+    private static int parseInt(String value, int defaultValue) {
+        try {
+            return value == null ? defaultValue : Integer.parseInt(value);
+        } catch (Exception e) {
+            return defaultValue;
+        }
     }
 }

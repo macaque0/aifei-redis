@@ -88,13 +88,17 @@ redis.queue.maintainBatchSize = 100
 redis.queue.defaultVisibilityTimeoutMillis = 30000
 redis.queue.defaultMaxRetries = 16
 redis.queue.deadLetterSuffix = dead
+redis.queue.listenerEnabled = true
+redis.queue.listenerPackages =
+redis.queue.messageLogEnabled = false
+redis.queue.messageLogBodyEnabled = false
 ```
 
 常用配置说明：
 
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
-| `redis.keyPrefix` | `aifei` | 普通 Redis key 前缀，队列 key 也使用它做命名空间 |
+| `redis.keyPrefix` | `aifei` | 队列 key 自动使用此前缀；普通 Redis API 需要通过 `RedisKit.key(...)` 手动生成带前缀 key |
 | `redis.pool.maxTotal` | `32` | Jedis 连接池最大连接数 |
 | `redis.queue.maintainerEnabled` | `true` | 是否启动后台维护线程，用于延迟消息提升、超时消息重试等 |
 | `redis.queue.maintainIntervalMillis` | `1000` | 队列维护线程扫描间隔 |
@@ -102,28 +106,66 @@ redis.queue.deadLetterSuffix = dead
 | `redis.queue.defaultVisibilityTimeoutMillis` | `30000` | 可靠队列消息被 reserve 后的可见性超时时间 |
 | `redis.queue.defaultMaxRetries` | `16` | 默认最大重试次数 |
 | `redis.queue.deadLetterSuffix` | `dead` | 死信集合 key 后缀 |
+| `redis.queue.listenerEnabled` | `true` | 是否启用注解监听容器 |
+| `redis.queue.listenerPackages` | 空 | 自动扫描 `@RedisQueueListener` 的包，多个包用英文逗号分隔 |
+| `redis.queue.messageLogEnabled` | `false` | 是否启用内置队列消费日志 |
+| `redis.queue.messageLogBodyEnabled` | `false` | 队列消费日志是否包含消息 body，默认关闭以避免敏感信息进日志 |
 
 ## 常用 Redis API
 
 ```java
 import io.github.macaque0.aifei.redis.RedisKit;
+import io.github.macaque0.aifei.redis.RedisLock;
 
-RedisKit.setex("session:" + token, 7200, userId);
-String currentUserId = RedisKit.get("session:" + token);
+String sessionKey = RedisKit.key("session:" + token);
+RedisKit.setex(sessionKey, 7200, userId);
+String currentUserId = RedisKit.get(sessionKey);
 
-RedisKit.hset("user:" + userId, "name", "Alice");
-String name = RedisKit.hget("user:" + userId, "name");
+String userKey = RedisKit.key("user:" + userId);
+RedisKit.hset(userKey, "name", "Alice");
+String name = RedisKit.hget(userKey, "name");
 
-RedisKit.incr("counter:sms");
-RedisKit.rpush("list:jobs", "job-1", "job-2");
-long size = RedisKit.llen("list:jobs");
+RedisKit.incr(RedisKit.key("counter:sms"));
+RedisKit.rpush(RedisKit.key("list:jobs"), "job-1", "job-2");
+long size = RedisKit.llen(RedisKit.key("list:jobs"));
 
 String pong = RedisKit.execute(jedis -> jedis.ping());
 ```
 
+普通 Redis API 使用调用方传入的 key；如果希望使用配置的 `redis.keyPrefix` 命名空间，请显式调用 `RedisKit.key("...")`。队列 API 会自动加前缀。
+
+分布式锁：
+
+```java
+try (RedisLock lock = RedisKit.tryLock(RedisKit.key("lock:activity:" + activityId), 30000)) {
+    if (lock == null) {
+        return;
+    }
+    publishActivityResult(activityId);
+}
+```
+
+如果锁需要跨方法释放或续期，可以自己传入 token：
+
+```java
+String token = orderId + ":" + requestId;
+RedisLock lock = RedisKit.tryLock(RedisKit.key("lock:order:" + orderId), token, 30000);
+if (lock != null) {
+    try {
+        processOrder(orderId);
+        lock.renew(30000);
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+分布式锁基于 `SET key token NX PX expireMillis` 获取锁，释放和续期都用 Lua 校验 token，避免误删别人已经重新获取到的锁。锁超时时间必须大于业务预计执行时间；如果任务可能超过超时时间，需要主动调用 `renew` 续期。
+
 支持的常用 API 包括：
 
 - String：`get`、`set`、`setex`、`del`、`exists`、`expire`、`pexpire`、`ttl`、`pttl`
+- Distributed Lock：`tryLock`、`unlock`、`renewLock`
 - Counter：`incr`、`incrBy`、`decr`、`decrBy`
 - Hash：`hset`、`hget`、`hdel`、`hgetAll`
 - List：`lpush`、`rpush`、`lpop`、`rpop`、`llen`、`lrange`
@@ -161,6 +203,46 @@ if (message != null) {
 }
 ```
 
+也可以把 `poll -> 调用业务方法` 封装成注解监听：
+
+```java
+import io.github.macaque0.aifei.redis.queue.RedisQueueListener;
+
+public class SimpleJobListener {
+
+    @RedisQueueListener("simple-jobs")
+    public void handle(String body) {
+        handleJob(body);
+    }
+}
+```
+
+注册监听器有两种方式。手动注册：
+
+```java
+import cn.aifei.aop.Aop;
+import io.github.macaque0.aifei.redis.queue.RedisQueueListenerKit;
+
+RedisQueueListenerKit.register(Aop.get(SimpleJobListener.class));
+```
+
+或者配置自动扫描：
+
+```properties
+redis.queue.listenerPackages = com.example.listener,com.example.service
+```
+
+普通队列注解和手写 `poll` 语义一致：方法抛异常时消息也已经被取走，不会自动重试。
+
+注解监听默认会根据方法参数选择 codec：`String` 使用 `StringRedisCodec`，`byte[]` 使用 `ByteArrayRedisCodec`，其他对象使用 JSON。需要自定义编解码时可以指定 `codec`：
+
+```java
+@RedisQueueListener(value = "simple-jobs", codec = MyJobCodec.class)
+public void handle(MyJob job) {
+    handleJob(job);
+}
+```
+
 ## 延迟队列
 
 延迟队列保证消息不会早于指定时间被消费，但不保证毫秒级准时。
@@ -182,6 +264,25 @@ if (due != null) {
 
 delayQueue.cancel("order-1001");
 ```
+
+延迟队列也支持注解监听：
+
+```java
+import io.github.macaque0.aifei.redis.queue.RedisQueueListener;
+import io.github.macaque0.aifei.redis.queue.RedisQueueListenerMode;
+
+public class OrderTimeoutListener {
+
+    @RedisQueueListener(
+            value = "order-timeout",
+            mode = RedisQueueListenerMode.DELAY)
+    public void handle(String orderId) {
+        closeExpiredOrder(orderId);
+    }
+}
+```
+
+延迟队列注解同样是最多一次语义：消息到期后被 `poll` 出来，方法抛异常不会自动重试。需要重试/死信时，请用可靠队列模式。
 
 ## 可靠队列
 
@@ -228,6 +329,87 @@ queue.replayDead("sms-" + requestId);
 queue.replayDeadBatch(100);
 ```
 
+批量 API 可以减少 Redis 网络往返，适合短信、邮件、扫码事件这类高峰写入和批量消费：
+
+```java
+queue.offerBatch(Arrays.asList("18800000000", "18800000001", "18800000002"));
+
+List<RedisMessage<String>> messages = queue.reserveBatch("sms-worker-1", 100, 1000);
+try {
+    for (RedisMessage<String> msg : messages) {
+        sendSms(msg.getBody());
+    }
+    queue.ackBatch(messages.stream().map(RedisMessage::getId).toArray(String[]::new));
+} catch (Exception e) {
+    for (RedisMessage<String> msg : messages) {
+        queue.retryLater(msg.getId(), 30_000);
+    }
+}
+```
+
+可靠队列也可以用注解，推荐生产任务优先用这个模式：
+
+```java
+import io.github.macaque0.aifei.redis.queue.RedisMessage;
+import io.github.macaque0.aifei.redis.queue.RedisQueueListener;
+import io.github.macaque0.aifei.redis.queue.RedisQueueListenerMode;
+
+public class SmsListener {
+
+    @RedisQueueListener(
+            value = "sms",
+            mode = RedisQueueListenerMode.RELIABLE,
+            consumerId = "sms-worker",
+            concurrency = 4,
+            batchSize = 50,
+            visibilityTimeoutMillis = 30_000,
+            maxRetries = 10,
+            retryDelayMillis = 1000)
+    public void handle(RedisMessage<String> message) {
+        sendSms(message.getBody());
+    }
+}
+```
+
+可靠模式下，业务方法正常返回会自动 `ack`；方法抛异常会按配置重试，超过最大重试次数进入死信。
+
+## 消息日志和审计
+
+插件提供统一的队列消费事件入口，覆盖注解监听和 `RedisQueueWorker`：开始消费、成功、普通/延迟消费失败、可靠队列重试、死信、消费者线程异常。
+
+打开内置日志：
+
+```properties
+redis.queue.messageLogEnabled = true
+redis.queue.messageLogBodyEnabled = false
+```
+
+内置日志会记录 queue、message id、consumerId、attempts、耗时、重试延迟等信息。消息 body 默认不记录，生产环境建议保持关闭；确实需要排查问题时再临时打开。
+
+也可以接入自己的审计、指标或告警系统：
+
+```java
+import io.github.macaque0.aifei.redis.queue.RedisMessage;
+import io.github.macaque0.aifei.redis.queue.RedisQueueEventKit;
+import io.github.macaque0.aifei.redis.queue.RedisQueueEventListener;
+
+RedisQueueEventKit.setListener(new RedisQueueEventListener() {
+    @Override
+    public void onConsumeSuccess(String queue, RedisMessage<?> message,
+                                 String consumerId, long elapsedMillis) {
+        metrics.timer("redis.queue.consume", "queue", queue).record(elapsedMillis);
+    }
+
+    @Override
+    public void onDead(String queue, RedisMessage<?> message,
+                       String consumerId, Throwable error, long elapsedMillis) {
+        alert("queue dead letter: " + queue + ", id=" + message.getId(), error);
+    }
+});
+```
+
+自定义监听器建议在 `RedisPlugin` 启动后设置。事件监听器内部异常会被隔离，不会影响消息消费。
+
 ## Worker 自动消费
 
 `RedisQueueWorker` 会自动循环 `reserve`，handler 成功时自动 `ack`，失败时按重试策略 `retryLater` 或进入死信。
@@ -242,6 +424,7 @@ import io.github.macaque0.aifei.redis.queue.RetryDelayPolicy;
 RedisQueueWorker<String> worker = RedisQueueKit.worker("sms", String.class)
         .consumerId("sms-worker")
         .concurrency(4)
+        .batchSize(100)
         .pollTimeoutMillis(1000)
         .idleSleepMillis(50)
         .visibilityTimeoutMillis(30_000)
@@ -262,6 +445,8 @@ worker.start();
 // 应用停止时调用
 worker.close();
 ```
+
+`batchSize` 默认是 `1`。高吞吐可靠队列 worker 可以调大它，每个消费线程单次最多 reserve 这么多消息，并用 `ackBatch` 批量确认成功消息。
 
 ## 优先级队列
 
@@ -359,7 +544,7 @@ mvn "-Dredis.integration=true" "-Dredis.host=127.0.0.1" "-Dredis.port=6379" "-Dr
 非功能测试包括压测、worker soak、网络断连恢复，默认跳过：
 
 ```powershell
-mvn "-Dtest=RedisNonFunctionalIntegrationTest" "-Dredis.nonfunctional=true" "-Dredis.host=127.0.0.1" "-Dredis.port=6379" "-Dredis.password=<password>" "-Dredis.database=0" "-Dredis.nf.messages=1000" "-Dredis.nf.soakMillis=5000" test
+mvn "-Dtest=RedisNonFunctionalIntegrationTest" "-Dredis.nonfunctional=true" "-Dredis.host=127.0.0.1" "-Dredis.port=6379" "-Dredis.password=<password>" "-Dredis.database=0" "-Dredis.nf.messages=1000" "-Dredis.nf.soakMillis=5000" "-Dredis.nf.timeoutMillis=120000" test
 ```
 
 更多测试用例见 [doc/redis-plugin-test-cases.md](doc/redis-plugin-test-cases.md)。

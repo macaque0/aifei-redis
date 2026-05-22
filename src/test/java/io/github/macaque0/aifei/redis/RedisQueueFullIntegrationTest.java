@@ -98,6 +98,12 @@ public class RedisQueueFullIntegrationTest {
         assertFalse(dropNewest.offer("d2", "b"));
         assertEquals("a", dropNewest.poll(1000).getBody());
 
+        RedisQueue<String> duplicate = RedisQueueKit.queue("normal-duplicate", StringRedisCodec.INSTANCE,
+                new RedisQueueOptions().setMaxLength(1).setFullQueuePolicy(FullQueuePolicy.DROP_OLDEST));
+        assertTrue(duplicate.offer("same-id", "a"));
+        assertFalse(duplicate.offer("same-id", "b"));
+        assertEquals("a", duplicate.poll(1000).getBody());
+
         RedisQueue<String> reject = RedisQueueKit.queue("normal-reject", StringRedisCodec.INSTANCE,
                 new RedisQueueOptions().setMaxLength(1).setFullQueuePolicy(FullQueuePolicy.REJECT));
         assertTrue(reject.offer("r1", "a"));
@@ -113,9 +119,9 @@ public class RedisQueueFullIntegrationTest {
     public void delayQueueWaitsUntilDueAndCanCancel() throws Exception {
         RedisDelayQueue<String> queue = RedisQueueKit.delayQueue("delay", StringRedisCodec.INSTANCE, new RedisQueueOptions());
 
-        queue.offer("later", 200);
+        queue.offer("later", 1000);
         assertNull(queue.poll(0));
-        Thread.sleep(260);
+        Thread.sleep(1200);
         assertEquals("later", queue.poll(1000).getBody());
 
         assertTrue(queue.offer("cancel-me", "x", 5000));
@@ -171,7 +177,7 @@ public class RedisQueueFullIntegrationTest {
                         .setVisibilityTimeoutMillis(1000)
                         .setMaxRetries(3)
                         .setRetryDelayPolicy(RetryDelayPolicy.fixed(10))
-                        .setMessageTtlMillis(1000));
+                        .setMessageTtlMillis(5000));
 
         queue.offer("nack-id", "nack");
         RedisMessage<String> first = queue.reserve("manual-c", 1000);
@@ -251,6 +257,34 @@ public class RedisQueueFullIntegrationTest {
     }
 
     @Test
+    public void priorityQueueSupportsManualRetryLaterAndDeadCleanup() throws Exception {
+        RedisPriorityQueue<String> queue = RedisQueueKit.priorityQueue("priority-manual", StringRedisCodec.INSTANCE,
+                new RedisQueueOptions()
+                        .setVisibilityTimeoutMillis(1000)
+                        .setMaxRetries(3)
+                        .setRetryDelayPolicy(RetryDelayPolicy.fixed(10)));
+
+        queue.offer("later-id", "later", 7);
+        RedisMessage<String> later = queue.reserve("pc", 1000);
+        assertNotNull(later);
+        queue.retryLater(later.getId(), 200);
+        assertEquals(0, queue.reservedSize());
+        assertNull(queue.reserve("pc", 0));
+        Thread.sleep(260);
+        RedisMessage<String> due = queue.reserve("pc", 1000);
+        assertNotNull(due);
+        assertEquals("later", due.getBody());
+        queue.ack(due.getId());
+
+        queue.offer("dead-id", "dead", 9);
+        RedisMessage<String> dead = queue.reserve("pc", 1000);
+        assertNotNull(dead);
+        queue.dead(dead.getId(), "manual");
+        assertEquals(1, queue.deadSize());
+        assertFalse(RedisKit.execute(jedis -> jedis.hexists(prefix + ":queue:{priority-manual}:priority-value", "dead-id")));
+    }
+
+    @Test
     public void streamQueueSupportsGroupsPendingClaimPauseAndStats() throws Exception {
         RedisStreamQueue<String> stream = RedisQueueKit.streamQueue("stream", StringRedisCodec.INSTANCE, new RedisQueueOptions());
 
@@ -289,14 +323,15 @@ public class RedisQueueFullIntegrationTest {
                         new RedisQueueOptions().setVisibilityTimeoutMillis(1000).setMaxRetries(2))
                 .consumerId("worker-c")
                 .concurrency(1)
+                .batchSize(3)
                 .pollTimeoutMillis(100)
                 .idleSleepMillis(10)
                 .handler(handled::add);
 
         worker.start();
         try {
-            worker.getQueue().offer("w1", "hello");
-            waitUntil(() -> handled.contains("hello"), 3000);
+            worker.getQueue().offerBatch(Arrays.asList("hello-1", "hello-2", "hello-3"));
+            waitUntil(() -> handled.containsAll(Arrays.asList("hello-1", "hello-2", "hello-3")), 3000);
             assertEquals(0, worker.getQueue().reservedSize());
         } finally {
             worker.close();

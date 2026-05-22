@@ -2,6 +2,7 @@ package io.github.macaque0.aifei.redis;
 
 import io.github.macaque0.aifei.redis.codec.StringRedisCodec;
 import io.github.macaque0.aifei.redis.queue.RedisMessage;
+import io.github.macaque0.aifei.redis.queue.RedisQueue;
 import io.github.macaque0.aifei.redis.queue.RedisQueueKit;
 import io.github.macaque0.aifei.redis.queue.RedisQueueOptions;
 import io.github.macaque0.aifei.redis.queue.RedisQueueWorker;
@@ -21,6 +22,8 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -35,6 +38,8 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 public class RedisNonFunctionalIntegrationTest {
+
+    private static final long DEFAULT_TIMEOUT_MILLIS = 120000;
 
     private RedisPlugin plugin;
     private TcpProxy proxy;
@@ -61,11 +66,88 @@ public class RedisNonFunctionalIntegrationTest {
     }
 
     @Test
+    public void pressureSimpleQueueProducerConsumerThroughput() throws Exception {
+        int messages = intProp("redis.nf.messages", 1000);
+        int producers = intProp("redis.nf.producers", 4);
+        int consumers = intProp("redis.nf.consumers", 4);
+        int offerBatchSize = intProp("redis.nf.offerBatchSize", 1);
+        long timeoutMillis = longProp("redis.nf.timeoutMillis", DEFAULT_TIMEOUT_MILLIS);
+        startPlugin(required("redis.host"), Integer.getInteger("redis.port", 6379),
+                Math.max(8, producers + consumers + 4));
+
+        RedisQueue<String> queue = RedisQueueKit.queue("nf-simple", StringRedisCodec.INSTANCE,
+                new RedisQueueOptions());
+        Set<String> consumedIds = ConcurrentHashMap.newKeySet();
+        AtomicInteger duplicates = new AtomicInteger();
+        AtomicInteger sequence = new AtomicInteger();
+        CountDownLatch consumed = new CountDownLatch(messages);
+        AtomicBoolean consuming = new AtomicBoolean(true);
+
+        ExecutorService consumerExecutor = Executors.newFixedThreadPool(consumers);
+        ExecutorService producerExecutor = Executors.newFixedThreadPool(producers);
+        long started = System.nanoTime();
+        try {
+            for (int i = 0; i < consumers; i++) {
+                consumerExecutor.submit(() -> {
+                    while (consuming.get() && consumed.getCount() > 0) {
+                        RedisMessage<String> message = queue.poll();
+                        if (message == null) {
+                            sleepQuietly(1);
+                            continue;
+                        }
+                        if (!consumedIds.add(message.getBody())) {
+                            duplicates.incrementAndGet();
+                        }
+                        consumed.countDown();
+                    }
+                });
+            }
+            for (int i = 0; i < producers; i++) {
+                producerExecutor.submit(() -> {
+                    List<String> batch = new ArrayList<>(Math.max(1, offerBatchSize));
+                    int index;
+                    while ((index = sequence.getAndIncrement()) < messages) {
+                        String id = "q-" + index;
+                        if (offerBatchSize <= 1) {
+                            queue.offer(id, id);
+                        } else {
+                            batch.add(id);
+                            if (batch.size() >= offerBatchSize) {
+                                queue.offerBatch(batch);
+                                batch.clear();
+                            }
+                        }
+                    }
+                    if (!batch.isEmpty()) {
+                        queue.offerBatch(batch);
+                    }
+                });
+            }
+            producerExecutor.shutdown();
+            assertTrue("producers timed out", producerExecutor.awaitTermination(timeoutMillis, TimeUnit.MILLISECONDS));
+            assertTrue("consumers timed out", consumed.await(timeoutMillis, TimeUnit.MILLISECONDS));
+        } finally {
+            consuming.set(false);
+            consumerExecutor.shutdownNow();
+            producerExecutor.shutdownNow();
+        }
+        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+
+        assertEquals(messages, consumedIds.size());
+        assertEquals(0, duplicates.get());
+        assertEquals(0, queue.size());
+        System.out.println("nf.simple.messages=" + messages +
+                ", elapsedMillis=" + elapsedMillis +
+                ", throughputPerSecond=" + throughput(messages, elapsedMillis));
+    }
+
+    @Test
     public void pressureReliableQueueProducerConsumerThroughput() throws Exception {
         int messages = intProp("redis.nf.messages", 1000);
         int producers = intProp("redis.nf.producers", 4);
         int consumers = intProp("redis.nf.consumers", 4);
-        long timeoutMillis = longProp("redis.nf.timeoutMillis", 30000);
+        int offerBatchSize = intProp("redis.nf.offerBatchSize", 1);
+        long timeoutMillis = longProp("redis.nf.timeoutMillis", DEFAULT_TIMEOUT_MILLIS);
         startPlugin(required("redis.host"), Integer.getInteger("redis.port", 6379),
                 Math.max(8, producers + consumers + 4));
 
@@ -80,6 +162,7 @@ public class RedisNonFunctionalIntegrationTest {
                                 .setRetryDelayPolicy(RetryDelayPolicy.fixed(10)))
                 .consumerId("nf-pressure-c")
                 .concurrency(consumers)
+                .batchSize(intProp("redis.nf.batchSize", 1))
                 .pollTimeoutMillis(100)
                 .idleSleepMillis(1)
                 .messageHandler(message -> {
@@ -95,10 +178,22 @@ public class RedisNonFunctionalIntegrationTest {
         try {
             for (int i = 0; i < producers; i++) {
                 executor.submit(() -> {
+                    List<String> batch = new ArrayList<>(Math.max(1, offerBatchSize));
                     int index;
                     while ((index = sequence.getAndIncrement()) < messages) {
                         String id = "p-" + index;
-                        worker.getQueue().offer(id, id);
+                        if (offerBatchSize <= 1) {
+                            worker.getQueue().offer(id, id);
+                        } else {
+                            batch.add(id);
+                            if (batch.size() >= offerBatchSize) {
+                                worker.getQueue().offerBatch(batch);
+                                batch.clear();
+                            }
+                        }
+                    }
+                    if (!batch.isEmpty()) {
+                        worker.getQueue().offerBatch(batch);
                     }
                 });
             }
@@ -124,7 +219,7 @@ public class RedisNonFunctionalIntegrationTest {
     public void soakWorkerKeepsProcessingWithRetries() throws Exception {
         long durationMillis = longProp("redis.nf.soakMillis", 5000);
         int ratePerSecond = intProp("redis.nf.ratePerSecond", 50);
-        long timeoutMillis = longProp("redis.nf.timeoutMillis", 30000);
+        long timeoutMillis = longProp("redis.nf.timeoutMillis", DEFAULT_TIMEOUT_MILLIS);
         startPlugin(required("redis.host"), Integer.getInteger("redis.port", 6379), 12);
 
         Set<String> consumedIds = ConcurrentHashMap.newKeySet();
@@ -137,6 +232,7 @@ public class RedisNonFunctionalIntegrationTest {
                                 .setRetryDelayPolicy(RetryDelayPolicy.fixed(20)))
                 .consumerId("nf-soak-c")
                 .concurrency(intProp("redis.nf.consumers", 2))
+                .batchSize(intProp("redis.nf.batchSize", 1))
                 .pollTimeoutMillis(100)
                 .idleSleepMillis(5)
                 .messageHandler(message -> handleSoakMessage(message, handlerAttempts, consumedIds));
@@ -195,7 +291,7 @@ public class RedisNonFunctionalIntegrationTest {
             } catch (RuntimeException e) {
                 return false;
             }
-        }, longProp("redis.nf.timeoutMillis", 30000));
+        }, longProp("redis.nf.timeoutMillis", DEFAULT_TIMEOUT_MILLIS));
     }
 
     private static void handleSoakMessage(RedisMessage<String> message,
@@ -278,6 +374,14 @@ public class RedisNonFunctionalIntegrationTest {
 
     private static long throughput(int count, long elapsedMillis) {
         return elapsedMillis <= 0 ? count : Math.round(count * 1000.0 / elapsedMillis);
+    }
+
+    private static void sleepQuietly(long millis) {
+        try {
+            TimeUnit.MILLISECONDS.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private interface Check {

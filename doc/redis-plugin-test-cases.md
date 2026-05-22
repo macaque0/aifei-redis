@@ -14,7 +14,8 @@
 | R-06 | Set API | `sadd/smembers/srem` | 成员集合正确 | `RedisIntegrationTest` |
 | R-07 | ZSet API | `zadd/zrange/zrangeByScore/zrem` | 排序集合按 score 返回 | `RedisIntegrationTest` |
 | R-08 | Scan 和脚本 | `scan/eval/execute` | 扫描、Lua 和原生 Jedis 回调可用 | `RedisIntegrationTest` |
-| R-09 | Codec | String、byte[]、JDK、JSON 编解码 | 编解码前后一致 | `CodecTest` |
+| R-09 | 分布式锁 | `tryLock/unlock/renewLock` | 互斥获取、token 校验释放、续期和等待获取正确 | `RedisIntegrationTest` |
+| R-10 | Codec | String、byte[]、JDK、JSON 编解码 | 编解码前后一致 | `CodecTest` |
 
 ## 2. 队列配置和 Key
 
@@ -75,9 +76,15 @@
 
 | 用例 ID | 场景 | 操作 | 预期 | 自动化覆盖 |
 | --- | --- | --- | --- | --- |
-| WK-01 | 自动消费 | 启动 worker 后入队 | handler 被调用 | `RedisQueueFullIntegrationTest`, `RedisQueueWorkerTest` |
+| WK-01 | 自动消费 | 启动 worker 后批量入队 | handler 被调用，成功消息批量 ack | `RedisQueueFullIntegrationTest`, `RedisQueueWorkerTest` |
 | WK-02 | 自动 ack | handler 成功返回 | reserved 清空 | `RedisQueueFullIntegrationTest` |
 | WK-03 | 失败重试/死信 | handler 抛异常 | 按重试策略 nack/retry/dead | `RedisQueueFullIntegrationTest`, `RedisQueueWorkerTest` |
+| WK-04 | 普通队列注解监听 | `@RedisQueueListener("queue")` 方法接收 body | 入队后自动 poll 并调用业务方法 | `RedisQueueListenerIntegrationTest` |
+| WK-05 | 延迟队列注解监听 | `@RedisQueueListener(mode=DELAY)` 消费延迟消息 | 到期后自动 poll 并调用业务方法 | `RedisQueueListenerIntegrationTest` |
+| WK-06 | 可靠队列注解监听 | `@RedisQueueListener(mode=RELIABLE)` 方法首轮失败 | 自动重试，成功后 ack，无死信 | `RedisQueueListenerIntegrationTest` |
+| WK-07 | 注解监听重复注册 | 同一 bean 重复 `register` | 只创建一组 runner | `RedisQueueListenerContainerTest` |
+| WK-08 | 插件启动失败回滚 | 扫描到非法 listener 方法 | 启动失败后全局 Kit 清理干净 | `RedisPluginLifecycleTest` |
+| WK-09 | 队列消费事件 | 注解监听消费普通、延迟、可靠队列消息 | 记录 start/success/retry 等事件，不改变消费结果 | `RedisQueueListenerIntegrationTest` |
 
 ## 9. 执行命令
 
@@ -93,14 +100,14 @@ mvn -DskipTests package
 
 | 用例 ID | 场景 | 默认参数 | 预期 | 自动化覆盖 |
 | --- | --- | --- | --- | --- |
-| NF-01 | 并发压测 | `1000` 条消息，`4` 生产者，`4` 消费者 | 全部消费、无重复、无死信、reserved 清零 | `RedisNonFunctionalIntegrationTest` |
+| NF-01 | 并发压测 | `1000` 条消息，`4` 生产者，`4` 消费者，最长等待 `120s` | 全部消费、无重复、无死信、reserved 清零 | `RedisNonFunctionalIntegrationTest` |
 | NF-02 | 长时间 worker soak | `5s`，每秒 `50` 条，10% 消息首轮计划性失败 | 全部最终消费、无死信、reserved 清零 | `RedisNonFunctionalIntegrationTest` |
 | NF-03 | 网络抖动/断连恢复 | 本地 TCP 代理转发到真实 Redis，中途关闭再恢复 | 断连时命令失败，恢复后客户端可继续读写 | `RedisNonFunctionalIntegrationTest` |
 
 示例命令：
 
 ```powershell
-mvn "-Dredis.nonfunctional=true" "-Dredis.host=<host>" "-Dredis.port=<port>" "-Dredis.password=<password>" "-Dredis.database=<db>" "-Dredis.nf.messages=1000" "-Dredis.nf.soakMillis=5000" test
+mvn "-Dredis.nonfunctional=true" "-Dredis.host=<host>" "-Dredis.port=<port>" "-Dredis.password=<password>" "-Dredis.database=<db>" "-Dredis.nf.messages=1000" "-Dredis.nf.soakMillis=5000" "-Dredis.nf.timeoutMillis=120000" test
 ```
 
 常用参数：
@@ -110,6 +117,8 @@ mvn "-Dredis.nonfunctional=true" "-Dredis.host=<host>" "-Dredis.port=<port>" "-D
 | `redis.nf.messages` | 压测总消息数 | `1000` |
 | `redis.nf.producers` | 压测生产者线程数 | `4` |
 | `redis.nf.consumers` | worker 消费线程数 | `4`，soak 默认 `2` |
+| `redis.nf.offerBatchSize` | 生产端批量入队大小 | `1` |
+| `redis.nf.batchSize` | 可靠 worker 单次批量 reserve/ack 大小 | `1` |
 | `redis.nf.soakMillis` | worker soak 持续时间 | `5000` |
 | `redis.nf.ratePerSecond` | soak 生产速率 | `50` |
-| `redis.nf.timeoutMillis` | 每个阶段等待超时 | `30000` |
+| `redis.nf.timeoutMillis` | 每个阶段等待超时 | `120000` |

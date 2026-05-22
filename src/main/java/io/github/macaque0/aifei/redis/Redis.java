@@ -29,6 +29,16 @@ public interface Redis extends AutoCloseable {
 
     Long pttl(String key);
 
+    RedisLock tryLock(String key, long expireMillis);
+
+    RedisLock tryLock(String key, String token, long expireMillis);
+
+    RedisLock tryLock(String key, long expireMillis, long waitMillis);
+
+    Boolean unlock(String key, String token);
+
+    Boolean renewLock(String key, String token, long expireMillis);
+
     Long incr(String key);
 
     Long incrBy(String key, long delta);

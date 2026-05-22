@@ -6,6 +6,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+/**
+ * 可靠队列的后台消费者。
+ *
+ * <p>Worker 封装 reserve -> 执行业务 -> ack/retry/dead 的循环，适合生产任务直接使用。
+ * 业务 handler 必须保持幂等，因为可靠队列提供的是至少一次投递。</p>
+ */
 public class RedisQueueWorker<T> implements AutoCloseable {
 
     private final RedisQueueFactory queueFactory;
@@ -17,9 +23,11 @@ public class RedisQueueWorker<T> implements AutoCloseable {
 
     private String consumerId = "worker-" + Integer.toHexString(System.identityHashCode(this));
     private int concurrency = 1;
+    private int batchSize = 1;
     private long pollTimeoutMillis = 1000;
     private long idleSleepMillis = 50;
     private RedisMessageHandler<T> handler;
+    // 旧的 worker 级回调保留给业务定制；统一审计/指标建议使用 RedisQueueEventKit。
     private RedisQueueWorkerListener<T> listener = new RedisQueueWorkerListener<T>() {
     };
     private RedisReliableQueue<T> queue;
@@ -56,6 +64,14 @@ public class RedisQueueWorker<T> implements AutoCloseable {
             throw new IllegalArgumentException("concurrency must be positive");
         }
         this.concurrency = concurrency;
+        return this;
+    }
+
+    public RedisQueueWorker<T> batchSize(int batchSize) {
+        if (batchSize <= 0) {
+            throw new IllegalArgumentException("batchSize must be positive");
+        }
+        this.batchSize = batchSize;
         return this;
     }
 
@@ -122,6 +138,7 @@ public class RedisQueueWorker<T> implements AutoCloseable {
             running.set(false);
             throw new IllegalStateException("RedisQueueWorker handler has not been set");
         }
+        // Worker 始终使用可靠队列，确保业务执行失败时能 retry 或进入死信。
         queue = queueFactory.reliableQueue(queueName, codec, options);
         for (int i = 0; i < concurrency; i++) {
             Thread thread = new Thread(() -> runLoop(Thread.currentThread().getName()), "aifei-redis-worker-" + queueName + "-" + i);
@@ -129,7 +146,7 @@ public class RedisQueueWorker<T> implements AutoCloseable {
             threads.add(thread);
             thread.start();
         }
-        listener.onStart(this);
+        notifyStart();
     }
 
     public boolean isRunning() {
@@ -160,41 +177,129 @@ public class RedisQueueWorker<T> implements AutoCloseable {
             }
         }
         threads.clear();
-        listener.onStop(this);
+        notifyStop();
     }
 
     private void runLoop(String threadName) {
+        // consumerId 加线程名，方便在 Redis reserved 元数据和日志中定位具体消费线程。
         String actualConsumerId = consumerId + ":" + threadName;
         while (running.get()) {
             try {
-                RedisMessage<T> message = queue.reserve(actualConsumerId, pollTimeoutMillis);
-                if (message == null) {
+                List<RedisMessage<T>> messages = queue.reserveBatch(actualConsumerId, batchSize, pollTimeoutMillis);
+                if (messages.isEmpty()) {
                     sleep(idleSleepMillis);
                     continue;
                 }
-                handle(message);
+                handle(messages, actualConsumerId);
             } catch (Throwable e) {
-                listener.onError(e);
+                RedisQueueEventKit.consumerError(queueName, actualConsumerId, e);
+                notifyError(e);
                 sleep(idleSleepMillis);
             }
         }
     }
 
-    private void handle(RedisMessage<T> message) {
+    private void handle(List<RedisMessage<T>> messages, String actualConsumerId) {
+        List<HandledSuccess<T>> successes = new ArrayList<>();
+        for (RedisMessage<T> message : messages) {
+            HandledSuccess<T> success = handleWithoutAck(message, actualConsumerId);
+            if (success != null) {
+                successes.add(success);
+            }
+        }
+        if (successes.isEmpty()) {
+            return;
+        }
+        queue.ackBatch(successIds(successes));
+        for (HandledSuccess<T> success : successes) {
+            RedisQueueEventKit.consumeSuccess(queueName, success.message, actualConsumerId, success.elapsedMillis);
+            notifySuccess(success.message);
+        }
+    }
+
+    private HandledSuccess<T> handleWithoutAck(RedisMessage<T> message, String actualConsumerId) {
+        long started = System.currentTimeMillis();
+        RedisQueueEventKit.consumeStart(queueName, message, actualConsumerId);
         try {
             handler.handle(message);
-            queue.ack(message.getId());
-            listener.onSuccess(message);
+            // 只有业务方法正常返回才加入批量 ack；抛异常会进入 retry/dead 分支。
+            return new HandledSuccess<>(message, elapsedSince(started));
         } catch (Throwable e) {
             if (message.getAttempts() >= options.getMaxRetries()) {
+                // 达到最大尝试次数后进入死信，保留错误摘要便于后续排查或人工回放。
                 queue.dead(message.getId(), e.getClass().getName() + ":" + safe(e.getMessage()));
-                listener.onDead(message, e);
-                return;
+                RedisQueueEventKit.dead(queueName, message, actualConsumerId, e, elapsedSince(started));
+                notifyDead(message, e);
+                return null;
             }
             long delayMillis = options.getRetryDelayPolicy().nextDelayMillis(message.getAttempts(), message);
+            // 未达到最大重试次数时按策略延迟重试，避免失败消息立即反复冲击下游。
             queue.retryLater(message.getId(), Math.max(0, delayMillis));
-            listener.onRetry(message, e, Math.max(0, delayMillis));
+            RedisQueueEventKit.retry(queueName, message, actualConsumerId, e, Math.max(0, delayMillis), elapsedSince(started));
+            notifyRetry(message, e, Math.max(0, delayMillis));
+            return null;
         }
+    }
+
+    // 业务回调异常只记录为消费线程异常，不反向影响消息 ack/retry 结果。
+    private void notifyStart() {
+        try {
+            listener.onStart(this);
+        } catch (Throwable e) {
+            RedisQueueEventKit.consumerError(queueName, consumerId, e);
+        }
+    }
+
+    private void notifyStop() {
+        try {
+            listener.onStop(this);
+        } catch (Throwable e) {
+            RedisQueueEventKit.consumerError(queueName, consumerId, e);
+        }
+    }
+
+    private void notifySuccess(RedisMessage<T> message) {
+        try {
+            listener.onSuccess(message);
+        } catch (Throwable e) {
+            RedisQueueEventKit.consumerError(queueName, consumerId, e);
+        }
+    }
+
+    private void notifyRetry(RedisMessage<T> message, Throwable error, long delayMillis) {
+        try {
+            listener.onRetry(message, error, delayMillis);
+        } catch (Throwable e) {
+            RedisQueueEventKit.consumerError(queueName, consumerId, e);
+        }
+    }
+
+    private void notifyDead(RedisMessage<T> message, Throwable error) {
+        try {
+            listener.onDead(message, error);
+        } catch (Throwable e) {
+            RedisQueueEventKit.consumerError(queueName, consumerId, e);
+        }
+    }
+
+    private void notifyError(Throwable error) {
+        try {
+            listener.onError(error);
+        } catch (Throwable e) {
+            RedisQueueEventKit.consumerError(queueName, consumerId, e);
+        }
+    }
+
+    private static long elapsedSince(long started) {
+        return Math.max(0, System.currentTimeMillis() - started);
+    }
+
+    private static <T> String[] successIds(List<HandledSuccess<T>> successes) {
+        String[] ids = new String[successes.size()];
+        for (int i = 0; i < successes.size(); i++) {
+            ids[i] = successes.get(i).message.getId();
+        }
+        return ids;
     }
 
     private static void sleep(long millis) {
@@ -210,5 +315,16 @@ public class RedisQueueWorker<T> implements AutoCloseable {
 
     private static String safe(String value) {
         return value == null ? "" : value.replace("|", "_");
+    }
+
+    private static class HandledSuccess<T> {
+
+        private final RedisMessage<T> message;
+        private final long elapsedMillis;
+
+        private HandledSuccess(RedisMessage<T> message, long elapsedMillis) {
+            this.message = message;
+            this.elapsedMillis = elapsedMillis;
+        }
     }
 }

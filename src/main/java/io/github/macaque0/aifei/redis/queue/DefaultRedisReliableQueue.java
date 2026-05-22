@@ -1,6 +1,7 @@
 package io.github.macaque0.aifei.redis.queue;
 
 import io.github.macaque0.aifei.redis.Redis;
+import io.github.macaque0.aifei.redis.RedisException;
 import io.github.macaque0.aifei.redis.codec.RedisCodec;
 import io.github.macaque0.aifei.redis.script.RedisScripts;
 
@@ -60,9 +61,17 @@ class DefaultRedisReliableQueue<T> extends QueueSupport<T> implements RedisRelia
         if (bodies == null) {
             throw new IllegalArgumentException("bodies can not be null");
         }
-        for (T body : bodies) {
-            offer(body);
+        if (bodies.isEmpty()) {
+            return;
         }
+        List<String> args = batchOfferArgs(bodies);
+        redis.execute(jedis -> {
+            Object ret = jedis.eval(RedisScripts.OFFER_READY_BATCH, keys.commonKeys(), args);
+            if (((Number) ret).longValue() < 0) {
+                throw new RedisException("Queue is full: " + keys.name);
+            }
+            return null;
+        });
     }
 
     @Override
@@ -89,13 +98,7 @@ class DefaultRedisReliableQueue<T> extends QueueSupport<T> implements RedisRelia
         List<RedisMessage<T>> messages = new ArrayList<>();
         do {
             maintain();
-            while (messages.size() < count) {
-                RedisMessage<T> message = reserveOne(cid);
-                if (message == null) {
-                    break;
-                }
-                messages.add(message);
-            }
+            messages.addAll(reserveAvailableBatch(cid, count - messages.size()));
             if (!messages.isEmpty() || timeoutMillis == 0) {
                 return messages;
             }
@@ -115,9 +118,14 @@ class DefaultRedisReliableQueue<T> extends QueueSupport<T> implements RedisRelia
         if (messageIds == null) {
             return;
         }
-        for (String messageId : messageIds) {
-            ack(messageId);
+        if (messageIds.length == 0) {
+            return;
         }
+        List<String> ids = new ArrayList<>(messageIds.length);
+        for (String messageId : messageIds) {
+            ids.add(requireMessageId(messageId));
+        }
+        redis.execute(jedis -> jedis.eval(RedisScripts.ACK_BATCH, keys.commonKeys(), ids));
     }
 
     @Override
@@ -227,17 +235,30 @@ class DefaultRedisReliableQueue<T> extends QueueSupport<T> implements RedisRelia
         final long now = System.currentTimeMillis();
         final String meta = meta(now, now, 0, 0, null);
         return redis.execute(jedis -> {
-            if (options.getMaxLength() > 0 && jedis.llen(keys.ready) >= options.getMaxLength()) {
-                if (options.getFullQueuePolicy() == FullQueuePolicy.DROP_NEWEST) {
-                    return false;
-                }
-                enforceCapacity(jedis);
+            Object ret = jedis.eval(RedisScripts.OFFER_READY_LIMITED,
+                    keys.commonKeys(),
+                    Arrays.asList(id, encoded, meta, String.valueOf(options.getMaxLength()),
+                            options.getFullQueuePolicy().name()));
+            long value = ((Number) ret).longValue();
+            if (value < 0) {
+                throw new RedisException("Queue is full: " + keys.name);
             }
-            Object ret = jedis.eval(RedisScripts.OFFER_READY,
-                    Arrays.asList(keys.ready, keys.payload, keys.meta),
-                    Arrays.asList(id, encoded, meta));
-            return ((Number) ret).longValue() == 1L;
+            return value == 1L;
         });
+    }
+
+    private List<String> batchOfferArgs(List<T> bodies) {
+        List<String> args = new ArrayList<>(2 + bodies.size() * 3);
+        args.add(String.valueOf(options.getMaxLength()));
+        args.add(options.getFullQueuePolicy().name());
+        long now = System.currentTimeMillis();
+        for (T body : bodies) {
+            String id = newMessageId();
+            args.add(id);
+            args.add(encode(body));
+            args.add(meta(now, now, 0, 0, null));
+        }
+        return args;
     }
 
     @SuppressWarnings("unchecked")
@@ -262,6 +283,38 @@ class DefaultRedisReliableQueue<T> extends QueueSupport<T> implements RedisRelia
         int attempts = ((Number) values.get(2)).intValue();
         String meta = values.size() > 3 ? String.valueOf(values.get(3)) : meta(now, now, reservedUntil, attempts, consumerId);
         return message(id, body, meta, attempts);
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<RedisMessage<T>> reserveAvailableBatch(String consumerId, int count) {
+        if (count <= 0) {
+            return new ArrayList<>();
+        }
+        long now = System.currentTimeMillis();
+        long reservedUntil = now + options.getVisibilityTimeoutMillis();
+        int maxScan = Math.max(options.getMaintainBatchSize(), count);
+        Object ret = redis.execute(jedis -> {
+            if (isPaused(jedis)) {
+                return null;
+            }
+            return jedis.eval(RedisScripts.RESERVE_BATCH,
+                    Arrays.asList(keys.ready, keys.reserved, keys.payload, keys.meta, keys.attempts, keys.dead),
+                    Arrays.asList(String.valueOf(reservedUntil), consumerId, String.valueOf(maxScan),
+                            String.valueOf(now), String.valueOf(options.getMessageTtlMillis()), String.valueOf(count)));
+        });
+        List<RedisMessage<T>> messages = new ArrayList<>();
+        if (ret == null) {
+            return messages;
+        }
+        List<Object> values = (List<Object>) ret;
+        for (int i = 0; i + 3 < values.size(); i += 4) {
+            String id = String.valueOf(values.get(i));
+            String body = String.valueOf(values.get(i + 1));
+            int attempts = ((Number) values.get(i + 2)).intValue();
+            String meta = String.valueOf(values.get(i + 3));
+            messages.add(message(id, body, meta, attempts));
+        }
+        return messages;
     }
 
     private void promoteDelay(redis.clients.jedis.Jedis jedis, long now) {

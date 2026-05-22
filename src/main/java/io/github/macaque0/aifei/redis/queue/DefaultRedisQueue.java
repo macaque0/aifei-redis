@@ -1,9 +1,11 @@
 package io.github.macaque0.aifei.redis.queue;
 
 import io.github.macaque0.aifei.redis.Redis;
+import io.github.macaque0.aifei.redis.RedisException;
 import io.github.macaque0.aifei.redis.codec.RedisCodec;
 import io.github.macaque0.aifei.redis.script.RedisScripts;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
@@ -27,16 +29,15 @@ class DefaultRedisQueue<T> extends QueueSupport<T> implements RedisQueue<T> {
         final long now = System.currentTimeMillis();
         final String meta = meta(now, now, 0, 0, null);
         return redis.execute(jedis -> {
-            if (options.getMaxLength() > 0 && jedis.llen(keys.ready) >= options.getMaxLength()) {
-                if (options.getFullQueuePolicy() == FullQueuePolicy.DROP_NEWEST) {
-                    return false;
-                }
-                enforceCapacity(jedis);
+            Object ret = jedis.eval(RedisScripts.OFFER_READY_LIMITED,
+                    keys.commonKeys(),
+                    Arrays.asList(id, encoded, meta, String.valueOf(options.getMaxLength()),
+                            options.getFullQueuePolicy().name()));
+            long value = asLong(ret);
+            if (value < 0) {
+                throw new RedisException("Queue is full: " + keys.name);
             }
-            Object ret = jedis.eval(RedisScripts.OFFER_READY,
-                    Arrays.asList(keys.ready, keys.payload, keys.meta),
-                    Arrays.asList(id, encoded, meta));
-            return asLong(ret) == 1L;
+            return value == 1L;
         });
     }
 
@@ -45,9 +46,17 @@ class DefaultRedisQueue<T> extends QueueSupport<T> implements RedisQueue<T> {
         if (bodies == null) {
             throw new IllegalArgumentException("bodies can not be null");
         }
-        for (T body : bodies) {
-            offer(body);
+        if (bodies.isEmpty()) {
+            return;
         }
+        List<String> args = batchOfferArgs(bodies);
+        redis.execute(jedis -> {
+            Object ret = jedis.eval(RedisScripts.OFFER_READY_BATCH, keys.commonKeys(), args);
+            if (asLong(ret) < 0) {
+                throw new RedisException("Queue is full: " + keys.name);
+            }
+            return null;
+        });
     }
 
     @Override
@@ -127,6 +136,20 @@ class DefaultRedisQueue<T> extends QueueSupport<T> implements RedisQueue<T> {
 
     private static long asLong(Object value) {
         return ((Number) value).longValue();
+    }
+
+    private List<String> batchOfferArgs(List<T> bodies) {
+        List<String> args = new ArrayList<>(2 + bodies.size() * 3);
+        args.add(String.valueOf(options.getMaxLength()));
+        args.add(options.getFullQueuePolicy().name());
+        long now = System.currentTimeMillis();
+        for (T body : bodies) {
+            String id = newMessageId();
+            args.add(id);
+            args.add(encode(body));
+            args.add(meta(now, now, 0, 0, null));
+        }
+        return args;
     }
 
     private static void sleep(long millis) {

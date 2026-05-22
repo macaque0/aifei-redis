@@ -94,27 +94,62 @@ redis.queue.maintainBatchSize = 100
 redis.queue.defaultVisibilityTimeoutMillis = 30000
 redis.queue.defaultMaxRetries = 16
 redis.queue.deadLetterSuffix = dead
+redis.queue.listenerEnabled = true
+redis.queue.listenerPackages =
+redis.queue.messageLogEnabled = false
+redis.queue.messageLogBodyEnabled = false
 ```
 
 ## Common Redis APIs
 
 ```java
 import io.github.macaque0.aifei.redis.RedisKit;
+import io.github.macaque0.aifei.redis.RedisLock;
 
-RedisKit.setex("session:" + token, 7200, userId);
-String currentUserId = RedisKit.get("session:" + token);
+String sessionKey = RedisKit.key("session:" + token);
+RedisKit.setex(sessionKey, 7200, userId);
+String currentUserId = RedisKit.get(sessionKey);
 
-RedisKit.hset("user:" + userId, "name", "Alice");
-String name = RedisKit.hget("user:" + userId, "name");
+String userKey = RedisKit.key("user:" + userId);
+RedisKit.hset(userKey, "name", "Alice");
+String name = RedisKit.hget(userKey, "name");
 
-RedisKit.incr("counter:sms");
-RedisKit.rpush("list:jobs", "job-1", "job-2");
-long size = RedisKit.llen("list:jobs");
+RedisKit.incr(RedisKit.key("counter:sms"));
+RedisKit.rpush(RedisKit.key("list:jobs"), "job-1", "job-2");
+long size = RedisKit.llen(RedisKit.key("list:jobs"));
 
 String pong = RedisKit.execute(jedis -> jedis.ping());
 ```
 
-Supported command groups include String, counter, Hash, List, Set, ZSet, `scan`, `eval`, and native `execute`.
+Common Redis APIs use the key you pass in. Use `RedisKit.key("...")` when you want the configured `redis.keyPrefix` namespace. Queue APIs add the prefix automatically.
+
+Distributed lock:
+
+```java
+try (RedisLock lock = RedisKit.tryLock(RedisKit.key("lock:activity:" + activityId), 30000)) {
+    if (lock == null) {
+        return;
+    }
+    publishActivityResult(activityId);
+}
+```
+
+Use a custom token when the lock has to be released or renewed across method boundaries:
+
+```java
+String token = orderId + ":" + requestId;
+RedisLock lock = RedisKit.tryLock(RedisKit.key("lock:order:" + orderId), token, 30000);
+if (lock != null) {
+    try {
+        processOrder(orderId);
+        lock.renew(30000);
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+Supported command groups include String, counter, Hash, List, Set, ZSet, distributed lock, `scan`, `eval`, and native `execute`.
 
 ## Normal Queue
 
@@ -131,6 +166,46 @@ queue.offer("biz-id-2", "job-2");
 RedisMessage<String> message = queue.poll(5000);
 if (message != null) {
     handle(message.getBody());
+}
+```
+
+You can also use an annotation listener to hide the polling loop:
+
+```java
+import io.github.macaque0.aifei.redis.queue.RedisQueueListener;
+
+public class SimpleJobListener {
+
+    @RedisQueueListener("simple-jobs")
+    public void handle(String body) {
+        handleJob(body);
+    }
+}
+```
+
+Register a listener manually:
+
+```java
+import cn.aifei.aop.Aop;
+import io.github.macaque0.aifei.redis.queue.RedisQueueListenerKit;
+
+RedisQueueListenerKit.register(Aop.get(SimpleJobListener.class));
+```
+
+Or configure package scanning:
+
+```properties
+redis.queue.listenerPackages = com.example.listener,com.example.service
+```
+
+Normal queue listeners have the same semantics as manual `poll`: if the method throws, the message has already been removed.
+
+Listener codec selection is automatic: `String` uses `StringRedisCodec`, `byte[]` uses `ByteArrayRedisCodec`, and other types use JSON. You can also provide a custom no-arg codec:
+
+```java
+@RedisQueueListener(value = "simple-jobs", codec = MyJobCodec.class)
+public void handle(MyJob job) {
+    handleJob(job);
 }
 ```
 
@@ -153,6 +228,25 @@ if (due != null) {
 
 delayQueue.cancel("order-1001");
 ```
+
+Delay queues also support annotation listeners:
+
+```java
+import io.github.macaque0.aifei.redis.queue.RedisQueueListener;
+import io.github.macaque0.aifei.redis.queue.RedisQueueListenerMode;
+
+public class OrderTimeoutListener {
+
+    @RedisQueueListener(
+            value = "order-timeout",
+            mode = RedisQueueListenerMode.DELAY)
+    public void handle(String orderId) {
+        closeExpiredOrder(orderId);
+    }
+}
+```
+
+Delay listeners are still at-most-once. If the method throws, the message has already been removed. Use reliable mode when retry and dead letter are required.
 
 ## Reliable Queue
 
@@ -179,6 +273,87 @@ if (message != null) {
 queue.replayDead("sms-" + requestId);
 ```
 
+Batch APIs reduce Redis round trips for burst workloads:
+
+```java
+queue.offerBatch(Arrays.asList("18800000000", "18800000001", "18800000002"));
+
+List<RedisMessage<String>> messages = queue.reserveBatch("sms-worker-1", 100, 1000);
+try {
+    for (RedisMessage<String> msg : messages) {
+        sendSms(msg.getBody());
+    }
+    queue.ackBatch(messages.stream().map(RedisMessage::getId).toArray(String[]::new));
+} catch (Exception e) {
+    for (RedisMessage<String> msg : messages) {
+        queue.retryLater(msg.getId(), 30_000);
+    }
+}
+```
+
+Reliable queue listeners are recommended for production jobs:
+
+```java
+import io.github.macaque0.aifei.redis.queue.RedisMessage;
+import io.github.macaque0.aifei.redis.queue.RedisQueueListener;
+import io.github.macaque0.aifei.redis.queue.RedisQueueListenerMode;
+
+public class SmsListener {
+
+    @RedisQueueListener(
+            value = "sms",
+            mode = RedisQueueListenerMode.RELIABLE,
+            consumerId = "sms-worker",
+            concurrency = 4,
+            batchSize = 50,
+            visibilityTimeoutMillis = 30_000,
+            maxRetries = 10,
+            retryDelayMillis = 1000)
+    public void handle(RedisMessage<String> message) {
+        sendSms(message.getBody());
+    }
+}
+```
+
+In reliable mode, a successful method return automatically acknowledges the message. A thrown exception triggers retry and eventually dead letter.
+
+## Message Logs And Audit Events
+
+The plugin exposes one queue event hook for annotation listeners and `RedisQueueWorker`: consume start, success, normal/delay listener failure, reliable retry, dead letter, and consumer thread errors.
+
+Enable the built-in logger:
+
+```properties
+redis.queue.messageLogEnabled = true
+redis.queue.messageLogBodyEnabled = false
+```
+
+The built-in logger records queue name, message id, consumer id, attempts, elapsed time, and retry delay. Message body logging is disabled by default to avoid leaking sensitive data.
+
+You can also plug in metrics, audit, or alerting code:
+
+```java
+import io.github.macaque0.aifei.redis.queue.RedisMessage;
+import io.github.macaque0.aifei.redis.queue.RedisQueueEventKit;
+import io.github.macaque0.aifei.redis.queue.RedisQueueEventListener;
+
+RedisQueueEventKit.setListener(new RedisQueueEventListener() {
+    @Override
+    public void onConsumeSuccess(String queue, RedisMessage<?> message,
+                                 String consumerId, long elapsedMillis) {
+        metrics.timer("redis.queue.consume", "queue", queue).record(elapsedMillis);
+    }
+
+    @Override
+    public void onDead(String queue, RedisMessage<?> message,
+                       String consumerId, Throwable error, long elapsedMillis) {
+        alert("queue dead letter: " + queue + ", id=" + message.getId(), error);
+    }
+});
+```
+
+Set a custom listener after `RedisPlugin` starts. Listener exceptions are isolated and do not affect message consumption.
+
 ## Worker
 
 `RedisQueueWorker` runs the reliable queue loop for you. It reserves messages, acknowledges successful handling, retries failed handling, and moves exhausted messages to dead letter.
@@ -193,6 +368,7 @@ import io.github.macaque0.aifei.redis.queue.RetryDelayPolicy;
 RedisQueueWorker<String> worker = RedisQueueKit.worker("sms", String.class)
         .consumerId("sms-worker")
         .concurrency(4)
+        .batchSize(100)
         .pollTimeoutMillis(1000)
         .idleSleepMillis(50)
         .visibilityTimeoutMillis(30_000)
@@ -211,6 +387,8 @@ RedisQueueWorker<String> worker = RedisQueueKit.worker("sms", String.class)
 worker.start();
 worker.close();
 ```
+
+`batchSize` defaults to `1`. Increase it for high-throughput reliable workers; each worker thread reserves up to that many messages and acknowledges successes with `ackBatch`.
 
 ## Priority Queue
 
@@ -302,7 +480,7 @@ mvn "-Dredis.integration=true" "-Dredis.host=127.0.0.1" "-Dredis.port=6379" "-Dr
 Non-functional tests cover pressure, worker soak, and network-fault recovery. They are skipped by default:
 
 ```bash
-mvn "-Dtest=RedisNonFunctionalIntegrationTest" "-Dredis.nonfunctional=true" "-Dredis.host=127.0.0.1" "-Dredis.port=6379" "-Dredis.password=<password>" "-Dredis.database=0" "-Dredis.nf.messages=1000" "-Dredis.nf.soakMillis=5000" test
+mvn "-Dtest=RedisNonFunctionalIntegrationTest" "-Dredis.nonfunctional=true" "-Dredis.host=127.0.0.1" "-Dredis.port=6379" "-Dredis.password=<password>" "-Dredis.database=0" "-Dredis.nf.messages=1000" "-Dredis.nf.soakMillis=5000" "-Dredis.nf.timeoutMillis=120000" test
 ```
 
 See [doc/redis-plugin-test-cases.md](doc/redis-plugin-test-cases.md) for the full test case list.

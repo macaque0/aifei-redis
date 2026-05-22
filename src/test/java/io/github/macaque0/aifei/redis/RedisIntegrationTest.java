@@ -19,6 +19,7 @@ import java.util.Collections;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 public class RedisIntegrationTest {
@@ -103,6 +104,27 @@ public class RedisIntegrationTest {
                 Collections.singletonList(stringKey), Collections.emptyList()));
         assertEquals("PONG", RedisKit.execute(jedis -> jedis.ping()));
         assertTrue(scanContains(prefix + ":common:string"));
+
+        String lockKey = RedisKit.key("common:lock");
+        RedisLock lock = RedisKit.tryLock(lockKey, "token-1", 5000);
+        assertNotNull(lock);
+        assertNull(RedisKit.tryLock(lockKey, "token-2", 5000));
+        assertFalse(RedisKit.unlock(lockKey, "wrong-token"));
+        assertTrue(RedisKit.renewLock(lockKey, lock.getToken(), 10000));
+        assertTrue(RedisKit.pttl(lockKey) > 0);
+        assertTrue(lock.unlock());
+        assertFalse(lock.unlock());
+
+        RedisLock autoTokenLock = RedisKit.tryLock(lockKey, 1000);
+        assertNotNull(autoTokenLock);
+        assertTrue(autoTokenLock.unlock());
+
+        RedisLock shortLock = RedisKit.tryLock(lockKey, "short-token", 100);
+        assertNotNull(shortLock);
+        RedisLock waitedLock = RedisKit.tryLock(lockKey, 1000, 1000);
+        assertNotNull(waitedLock);
+        assertFalse(shortLock.unlock());
+        assertTrue(waitedLock.unlock());
 
         assertTrue(RedisKit.del(stringKey) >= 1);
         assertFalse(RedisKit.exists(stringKey));

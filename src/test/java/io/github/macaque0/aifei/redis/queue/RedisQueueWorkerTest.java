@@ -17,6 +17,7 @@ public class RedisQueueWorkerTest {
 
         worker.consumerId("c1")
                 .concurrency(2)
+                .batchSize(10)
                 .pollTimeoutMillis(10)
                 .idleSleepMillis(1)
                 .visibilityTimeoutMillis(100)
@@ -34,6 +35,12 @@ public class RedisQueueWorkerTest {
     public void rejectsInvalidConcurrency() {
         new RedisQueueWorker<>(new StubQueueFactory(), "jobs", StringRedisCodec.INSTANCE, new RedisQueueOptions())
                 .concurrency(0);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void rejectsInvalidBatchSize() {
+        new RedisQueueWorker<>(new StubQueueFactory(), "jobs", StringRedisCodec.INSTANCE, new RedisQueueOptions())
+                .batchSize(0);
     }
 
     @Test(expected = IllegalStateException.class)
